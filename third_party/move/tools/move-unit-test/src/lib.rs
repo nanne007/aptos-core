@@ -185,7 +185,7 @@ impl UnitTestingConfig {
 
     /// Public entry point to Move unit testing as a library
     /// Returns `true` if all unit tests passed. Otherwise, returns `false`.
-    pub fn run_and_report_unit_tests<W: Write + Send, F: UnitTestFactory + Send>(
+    pub fn run_and_report_unit_tests<W: Write + Send, F: UnitTestFactory + Send + Sync>(
         &self,
         test_plan: TestPlan,
         native_function_table: Option<NativeFunctionTable>,
@@ -194,7 +194,7 @@ impl UnitTestingConfig {
         factory: F,
     ) -> Result<(W, bool)> {
         let shared_writer = Mutex::new(writer);
-        let shared_options = Mutex::new(factory);
+        let shared_options = factory;
 
         if self.list {
             for (module_id, test_plan) in &test_plan.module_tests {

@@ -2,10 +2,12 @@
 // Copyright (c) The Move Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{format_module_id, DEFAULT_EXECUTION_BOUND};
+use crate::extensions::new_extensions;
+use crate::{extensions, format_module_id, DEFAULT_EXECUTION_BOUND};
 use codespan_reporting::files::{Files, SimpleFiles};
 use colored::{control, Colorize};
 pub use legacy_move_compiler::unit_test::ExpectedMoveError as MoveError;
+use legacy_move_compiler::unit_test::TestCase;
 use legacy_move_compiler::{
     diagnostics::{self, Diagnostic, Diagnostics},
     unit_test::{ModuleTestPlan, NamedOrBytecodeModule, TestName, TestPlan},
@@ -15,19 +17,20 @@ use move_binary_format::{
     errors::{ExecutionState, Location, VMError, VMResult},
 };
 use move_command_line_common::{env::read_bool_env_var, files::FileHash};
+use move_core_types::account_address::AccountAddress;
+use move_core_types::effects::Op;
 use move_core_types::{effects::ChangeSet, language_storage::ModuleId, vm_status::StatusType};
 use move_ir_types::location::Loc;
+use move_resource_viewer::MoveValueAnnotator;
 use move_symbol_pool::Symbol;
 use move_vm_runtime::native_extensions::NativeContextExtensions;
+use move_vm_runtime::{AsFunctionValueExtension, AsUnsyncModuleStorage, ModuleStorage, RuntimeEnvironment};
 use move_vm_test_utils::gas_schedule::{zero_cost_schedule, CostTable, GasCost, GasStatus};
+use move_vm_test_utils::InMemoryStorage;
 use move_vm_types::gas::GasMeter;
+use move_vm_types::resolver::ResourceResolver;
 use once_cell::sync::Lazy;
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    io::{Result, Write},
-    sync::Mutex,
-    time::Duration,
-};
+use std::{collections::{BTreeMap, BTreeSet, HashMap}, io::Result, io::Write, sync::Mutex, time::Duration};
 
 /// A gas schedule where every instruction has a cost of "1". This is used to bound execution of a
 /// test to a certain number of ticks.
@@ -39,16 +42,38 @@ fn unit_cost_table() -> CostTable {
     cost_schedule
 }
 
+pub trait AsModuleStorage {
+    fn as_module_storage(&self) -> impl ModuleStorage;
+}
+pub trait AsResourceResolver {
+    fn as_resource_resolver(&self) -> impl ResourceResolver;
+}
+
 pub trait UnitTestFactory {
     type GasMeter: GasMeter;
+    type Resolver: AsModuleStorage + AsResourceResolver;
     fn new_gas_meter(&self) -> Self::GasMeter;
     fn finalize_test_run_info(
         &self,
+        resolver: &Self::Resolver,
         change_set: &ChangeSet,
         extensions: &mut NativeContextExtensions,
         gas_meter: Self::GasMeter,
         test_run_info: TestRunInfo,
     ) -> TestRunInfo;
+    fn resolver(&self, test_plan: &TestPlan, module_test_plan: &ModuleTestPlan, test: &TestCase) -> Self::Resolver;
+    fn extensions<'a>(&'a self, resolver: &'a Self::Resolver) -> NativeContextExtensions<'a>;
+}
+
+impl AsModuleStorage for InMemoryStorage {
+    fn as_module_storage(&self) -> impl ModuleStorage {
+        self.as_unsync_module_storage()
+    }
+}
+impl AsResourceResolver for InMemoryStorage {
+    fn as_resource_resolver(&self) -> impl ResourceResolver {
+        self.clone()
+    }
 }
 
 pub struct UnitTestFactoryWithCostTable {
@@ -68,6 +93,7 @@ impl UnitTestFactoryWithCostTable {
 impl UnitTestFactory for UnitTestFactoryWithCostTable {
     type GasMeter = GasStatus;
 
+    type Resolver = InMemoryStorage;
     fn new_gas_meter(&self) -> Self::GasMeter {
         GasStatus::new(self.cost_table.clone(), self.gas_limit.into())
     }
@@ -75,14 +101,34 @@ impl UnitTestFactory for UnitTestFactoryWithCostTable {
     // @dev: the caller must fill the test_run_info.gas_used field in the returned TestRunInfo
     fn finalize_test_run_info(
         &self,
-        _: &ChangeSet,
-        _: &mut NativeContextExtensions,
+        resolver: &Self::Resolver,
+        cs: &ChangeSet,
+        extensions: &mut NativeContextExtensions,
         gas_status: Self::GasMeter,
         mut test_run_info: TestRunInfo,
     ) -> TestRunInfo {
         let remaining_gas: u64 = gas_status.remaining_gas().into();
         test_run_info.gas_used = self.gas_limit - remaining_gas;
+        let state =
+            print_resources_and_extensions(cs, extensions, resolver).ok();
+        test_run_info.storage_state = state;
         test_run_info
+    }
+
+
+    // TODO: This is a temporary implementation that uses an in-memory storage with the Move stdlib natives.
+    fn resolver(&self, _test_plan: &TestPlan, _module_test_plan: &ModuleTestPlan, _test: &TestCase) -> Self::Resolver {
+        let store = InMemoryStorage::new_with_runtime_environment(RuntimeEnvironment::new(
+            move_stdlib::natives::all_natives(
+                AccountAddress::from_hex_literal("0x1").unwrap(),
+                move_stdlib::natives::GasParameters::zeros(),
+            )
+        ));
+        store
+    }
+
+    fn extensions(&self, _resolver: &Self::Resolver) -> NativeContextExtensions {
+        new_extensions()
     }
 }
 
@@ -114,7 +160,6 @@ pub struct TestFailure {
     pub test_run_info: TestRunInfo,
     pub vm_error: Option<VMError>,
     pub failure_reason: FailureReason,
-    pub storage_state: Option<String>,
 }
 
 #[derive(Debug, Clone, Ord, PartialOrd, PartialEq, Eq)]
@@ -122,6 +167,7 @@ pub struct TestRunInfo {
     pub function_ident: String,
     pub elapsed_time: Duration,
     pub gas_used: u64,
+    pub storage_state: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -143,6 +189,7 @@ impl TestRunInfo {
             function_ident,
             elapsed_time,
             gas_used: 0,
+            storage_state: None
         }
     }
 }
@@ -200,13 +247,11 @@ impl TestFailure {
         failure_reason: FailureReason,
         test_run_info: TestRunInfo,
         vm_error: Option<VMError>,
-        storage_state: Option<String>,
     ) -> Self {
         Self {
             test_run_info,
             vm_error,
             failure_reason,
-            storage_state,
         }
     }
 
@@ -278,7 +323,7 @@ impl TestFailure {
             FailureReason::Property(message) => message.clone(),
         };
 
-        match &self.storage_state {
+        match &self.test_run_info.storage_state {
             None => error_string,
             Some(storage_state) => {
                 format!(
@@ -658,4 +703,36 @@ impl TestResults {
         )?;
         Ok(num_failed_tests == 0)
     }
+}
+
+
+/// Print the updates to storage represented by `cs` in the context of the starting storage state
+/// `storage`.
+fn print_resources_and_extensions(
+    cs: &ChangeSet,
+    extensions: &mut NativeContextExtensions,
+    storage: &InMemoryStorage,
+) -> anyhow::Result<String> {
+    use std::fmt::Write;
+    let mut buf = String::new();
+    let annotator = MoveValueAnnotator::new(storage.clone());
+    for (account_addr, account_state) in cs.accounts() {
+        writeln!(&mut buf, "0x{}:", account_addr.short_str_lossless())?;
+
+        for (tag, resource_op) in account_state.resources() {
+            if let Op::New(resource) | Op::Modify(resource) = resource_op {
+                writeln!(
+                    &mut buf,
+                    "\t{}",
+                    format!("=> {}", annotator.view_resource(tag, resource)?).replace('\n', "\n\t")
+                )?;
+            }
+        }
+    }
+
+    let module_storage = storage.as_unsync_module_storage();
+    let function_value_extension = module_storage.as_function_value_extension();
+    extensions::print_change_sets(&mut buf, extensions, &function_value_extension);
+
+    Ok(buf)
 }

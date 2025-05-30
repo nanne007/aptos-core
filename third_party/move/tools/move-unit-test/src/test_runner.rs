@@ -3,10 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    extensions, format_module_id,
+    format_module_id,
     test_reporter::{
-        FailureReason, MoveError, TestFailure, TestResults, TestRunInfo, TestStatistics,
-        UnitTestFactory,
+        AsModuleStorage, AsResourceResolver, FailureReason, MoveError, TestFailure, TestResults,
+        TestRunInfo, TestStatistics, UnitTestFactory
     },
 };
 use anyhow::Result;
@@ -21,19 +21,18 @@ use move_binary_format::{
 use move_bytecode_utils::Modules;
 use move_core_types::{
     account_address::AccountAddress,
-    effects::{ChangeSet, Op},
+    effects::ChangeSet,
     identifier::IdentStr,
     value::serialize_values,
     vm_status::StatusCode,
 };
-use move_resource_viewer::MoveValueAnnotator;
 use move_vm_runtime::{
     data_cache::TransactionDataCache,
     module_traversal::{TraversalContext, TraversalStorage},
-    move_vm::MoveVM,
-    native_extensions::NativeContextExtensions,
-    native_functions::NativeFunctionTable,
-    AsFunctionValueExtension, AsUnsyncModuleStorage, ModuleStorage, RuntimeEnvironment,
+    move_vm::MoveVM
+    ,
+    native_functions::NativeFunctionTable
+    , ModuleStorage, RuntimeEnvironment,
 };
 use move_vm_test_utils::InMemoryStorage;
 use rayon::prelude::*;
@@ -72,37 +71,6 @@ fn setup_test_storage<'a>(
     }
 
     Ok(storage)
-}
-
-/// Print the updates to storage represented by `cs` in the context of the starting storage state
-/// `storage`.
-fn print_resources_and_extensions(
-    cs: &ChangeSet,
-    extensions: &mut NativeContextExtensions,
-    storage: &InMemoryStorage,
-) -> Result<String> {
-    use std::fmt::Write;
-    let mut buf = String::new();
-    let annotator = MoveValueAnnotator::new(storage.clone());
-    for (account_addr, account_state) in cs.accounts() {
-        writeln!(&mut buf, "0x{}:", account_addr.short_str_lossless())?;
-
-        for (tag, resource_op) in account_state.resources() {
-            if let Op::New(resource) | Op::Modify(resource) = resource_op {
-                writeln!(
-                    &mut buf,
-                    "\t{}",
-                    format!("=> {}", annotator.view_resource(tag, resource)?).replace('\n', "\n\t")
-                )?;
-            }
-        }
-    }
-
-    let module_storage = storage.as_unsync_module_storage();
-    let function_value_extension = module_storage.as_function_value_extension();
-    extensions::print_change_sets(&mut buf, extensions, &function_value_extension);
-
-    Ok(buf)
 }
 
 impl TestRunner {
@@ -152,10 +120,10 @@ impl TestRunner {
         })
     }
 
-    pub fn run<W: Write + Send, F: UnitTestFactory + Send>(
+    pub fn run<W: Write + Send, F: UnitTestFactory + Send + Sync>(
         self,
         writer: &Mutex<W>,
-        options: &Mutex<F>,
+        options: &F,
     ) -> Result<TestResults> {
         rayon::ThreadPoolBuilder::new()
             .num_threads(self.num_threads)
@@ -168,7 +136,7 @@ impl TestRunner {
                     .par_iter()
                     .map(|(_, test_plan)| {
                         self.testing_config
-                            .exec_module_tests(test_plan, writer, options)
+                            .exec_module_tests(&self.tests, test_plan, writer, options)
                     })
                     .reduce(TestStatistics::new, |acc, stats| acc.combine(stats));
 
@@ -240,20 +208,23 @@ impl SharedTestingConfig {
     #[allow(clippy::field_reassign_with_default)]
     fn execute_via_move_vm<F: UnitTestFactory>(
         &self,
+        test: &TestPlan,
         test_plan: &ModuleTestPlan,
         function_name: &str,
         test_info: &TestCase,
-        factory: &Mutex<F>,
+        factory: &F,
     ) -> (
         VMResult<ChangeSet>,
-        VMResult<NativeContextExtensions>,
         VMResult<Vec<Vec<u8>>>,
         TestRunInfo,
     ) {
-        let module_storage = self.starting_storage_state.as_unsync_module_storage();
+        let storage = factory.resolver(test, test_plan, test_info);
 
-        let mut extensions = extensions::new_extensions();
-        let mut gas_meter = factory.lock().unwrap().new_gas_meter();
+        let module_storage = storage.as_module_storage();
+        let resource_resolver = storage.as_resource_resolver();
+
+        let mut extensions = factory.extensions(&storage);
+        let mut gas_meter = factory.new_gas_meter();
         let traversal_storage = TraversalStorage::new();
         let mut traversal_context = TraversalContext::new(&traversal_storage);
         let mut data_cache = TransactionDataCache::empty();
@@ -278,7 +249,7 @@ impl SharedTestingConfig {
                     &mut traversal_context,
                     &mut extensions,
                     &module_storage,
-                    &self.starting_storage_state,
+                    &resource_resolver,
                 )
             });
 
@@ -301,7 +272,8 @@ impl SharedTestingConfig {
             .map_err(|err| err.finish(Location::Undefined));
         match result {
             Ok(change_set) => {
-                let finalized_test_run_info = factory.lock().unwrap().finalize_test_run_info(
+                let finalized_test_run_info = factory.finalize_test_run_info(
+                    &storage,
                     &change_set,
                     &mut extensions,
                     gas_meter,
@@ -310,26 +282,28 @@ impl SharedTestingConfig {
 
                 (
                     Ok(change_set),
-                    Ok(extensions),
                     return_result,
                     finalized_test_run_info,
                 )
             },
-            Err(err) => (Err(err.clone()), Err(err), return_result, test_run_info),
+            Err(err) => {
+                (Err(err.clone()), return_result, test_run_info)
+            },
         }
     }
 
     fn exec_module_tests_move_vm_and_stackless_vm<F: UnitTestFactory>(
         &self,
+        test: &TestPlan,
         test_plan: &ModuleTestPlan,
         output: &TestOutput<impl Write>,
-        factory: &Mutex<F>,
+        factory: &F,
     ) -> TestStatistics {
         let mut stats = TestStatistics::new();
 
         for (function_name, test_info) in &test_plan.tests {
-            let (cs_result, ext_result, exec_result, test_run_info) =
-                self.execute_via_move_vm(test_plan, function_name, test_info, factory);
+            let (cs_result, exec_result, mut test_run_info) =
+                self.execute_via_move_vm(test, test_plan, function_name, test_info, factory);
 
             if self.record_writeset {
                 stats.test_output(
@@ -338,23 +312,9 @@ impl SharedTestingConfig {
                     format!("{:?}", cs_result),
                 );
             }
-
-            let save_session_state = || {
-                if self.save_storage_state_on_failure {
-                    cs_result.ok().and_then(|changeset| {
-                        ext_result.ok().and_then(|mut extensions| {
-                            print_resources_and_extensions(
-                                &changeset,
-                                &mut extensions,
-                                &self.starting_storage_state,
-                            )
-                            .ok()
-                        })
-                    })
-                } else {
-                    None
-                }
-            };
+            if !self.save_storage_state_on_failure {
+                test_run_info.storage_state = None;
+            }
 
             match exec_result {
                 Err(err) => {
@@ -392,7 +352,6 @@ impl SharedTestingConfig {
                                     FailureReason::wrong_error(expected_err.clone(), actual_err),
                                     test_run_info,
                                     Some(err),
-                                    save_session_state(),
                                 ),
                                 test_plan,
                             )
@@ -407,7 +366,6 @@ impl SharedTestingConfig {
                                     ),
                                     test_run_info,
                                     Some(err),
-                                    save_session_state(),
                                 ),
                                 test_plan,
                             )
@@ -420,7 +378,6 @@ impl SharedTestingConfig {
                                     FailureReason::timeout(),
                                     test_run_info,
                                     Some(err),
-                                    save_session_state(),
                                 ),
                                 test_plan,
                             )
@@ -432,7 +389,6 @@ impl SharedTestingConfig {
                                     FailureReason::unexpected_error(actual_err),
                                     test_run_info,
                                     Some(err),
-                                    save_session_state(),
                                 ),
                                 test_plan,
                             )
@@ -448,7 +404,6 @@ impl SharedTestingConfig {
                                 FailureReason::no_error(),
                                 test_run_info,
                                 None,
-                                save_session_state(),
                             ),
                             test_plan,
                         )
@@ -466,11 +421,12 @@ impl SharedTestingConfig {
 
     fn exec_module_tests<F: UnitTestFactory>(
         &self,
+        test: &TestPlan,
         test_plan: &ModuleTestPlan,
         writer: &Mutex<impl Write>,
-        factory: &Mutex<F>,
+        factory: &F,
     ) -> TestStatistics {
         let output = TestOutput { test_plan, writer };
-        self.exec_module_tests_move_vm_and_stackless_vm(test_plan, &output, factory)
+        self.exec_module_tests_move_vm_and_stackless_vm(test, test_plan, &output, factory)
     }
 }
