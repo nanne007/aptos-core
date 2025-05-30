@@ -147,6 +147,9 @@ impl ModelBuilder {
                         .compiler_config
                         .experiments,
                 );
+                options.testing = self.resolution_graph.build_options.test_mode;
+                options.compile_test_code = self.resolution_graph.build_options.test_mode || self.resolution_graph.build_options.full_model_generation;
+
                 let mut error_writer = StandardStream::stderr(ColorChoice::Auto);
                 move_compiler_v2::run_move_compiler_for_analysis(&mut error_writer, options)
             },

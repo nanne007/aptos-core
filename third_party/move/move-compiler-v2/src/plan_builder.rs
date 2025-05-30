@@ -18,6 +18,7 @@ use legacy_move_compiler::{
     unit_test::{ExpectedFailure, ExpectedMoveError, ModuleTestPlan, TestCase},
 };
 use move_command_line_common::{address::NumericalAddress, parser::NumberFormat};
+use move_core_types::u256::U256;
 use move_core_types::{
     identifier::Identifier, language_storage::ModuleId, value::MoveValue, vm_status::StatusCode,
 };
@@ -27,9 +28,8 @@ use move_model::{
     symbol::Symbol,
     ty::{PrimitiveType, Type},
 };
-use num::{BigInt, ToPrimitive};
+use num::{BigInt, Signed, ToPrimitive};
 use std::collections::BTreeMap;
-
 //***************************************************************************
 // Test Plan Building
 //***************************************************************************
@@ -184,7 +184,39 @@ fn build_test_info(
                     ]);
                 },
             },
-            Some(value) => arguments.push(value.clone()),
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U8)) && *v <= U256::from(u8::MAX) => {
+                arguments.push(MoveValue::U8(v.unchecked_as_u8()))
+            },
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U16)) && *v <= U256::from(u16::MAX) => {
+                arguments.push(MoveValue::U16(v.unchecked_as_u16()))
+            },
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U32)) && *v <= U256::from(u32::MAX) => {
+                arguments.push(MoveValue::U32(v.unchecked_as_u32()))
+            },
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U64)) && *v <= U256::from(u64::MAX) => {
+                arguments.push(MoveValue::U64(v.unchecked_as_u64()))
+            },
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U128)) && *v <= U256::from(u128::MAX) => {
+                arguments.push(MoveValue::U128(v.unchecked_as_u128()))
+            },
+            Some(MoveValue::U256(v)) if matches!(ty, Type::Primitive(PrimitiveType::U256)) => {
+                arguments.push(MoveValue::U256(*v))
+            },
+            Some(MoveValue::U256(_v)) => {
+                let invalid_param_msg = "Invalid test parameter assignment in test. Expected a \
+                                          parameter to be assigned in this attribute";
+                format!("Invalid test parameter assignment in test. Expected a {:?}\
+                                          parameter to be assigned in this attribute", ty);
+                let invalid_test = "unable to generate test";
+                env.error_with_labels(&fn_id_loc, invalid_test, vec![
+                    (test_attribute_loc.clone(), invalid_param_msg.to_string()),
+                    (
+                        var_loc.clone(),
+                        "Corresponding to this parameter".to_string(),
+                    ),
+                ]);
+            },
+            Some(v) => arguments.push(v.clone()),
             None => {
                 let missing_param_msg = "Missing test parameter assignment in test. Expected a \
                                          parameter to be assigned in this attribute";
@@ -700,6 +732,17 @@ fn convert_attribute_value_to_move_value(
             Address::Symbolic(sym) => env.resolve_address_alias(*sym),
         }
         .map(MoveValue::Address),
+        AttributeValue::Value(_id, Value::ByteArray(bytes)) => {
+            Some(MoveValue::vector_u8(bytes.to_vec()))
+        },
+        AttributeValue::Value(_id, Value::Bool(b)) => Some(MoveValue::Bool(*b)),
+        AttributeValue::Value(_id, Value::Number(b)) if b.is_positive() => {
+            let mut bytes = [0u8; 32];
+            b.to_biguint().unwrap().to_bytes_le().into_iter().enumerate().for_each(|(i, b)| {
+                bytes[i] = b;
+            });
+            Some(MoveValue::U256(U256::from_le_bytes(&bytes)))
+        },
         _ => None,
     }
 }

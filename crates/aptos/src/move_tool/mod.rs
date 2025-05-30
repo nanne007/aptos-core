@@ -1,6 +1,7 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::move_tool::unit_test_factory::{fork_attributes, AptosUnitTestFactory};
 use crate::{
     account::derive_resource_account::ResourceAccountSeed,
     common::{
@@ -86,6 +87,7 @@ mod manifest;
 pub mod package_hooks;
 mod show;
 pub mod stored_package;
+mod unit_test_factory;
 
 const HELLO_BLOCKCHAIN_EXAMPLE: &str = include_str!(
     "../../../../aptos-move/move-examples/hello_blockchain/sources/hello_blockchain.move"
@@ -560,7 +562,8 @@ impl CliCommand<&'static str> for TestPackage {
     }
 
     async fn execute(self) -> CliTypedResult<&'static str> {
-        let known_attributes = extended_checks::get_all_attribute_names();
+        let mut known_attributes = extended_checks::get_all_attribute_names().clone();
+        known_attributes.insert(fork_attributes::FORK.to_string());
         let mut config = BuildConfig {
             dev_mode: self.move_options.dev,
             additional_named_addresses: self.move_options.named_addresses(),
@@ -569,7 +572,7 @@ impl CliCommand<&'static str> for TestPackage {
             install_dir: self.move_options.output_dir.clone(),
             skip_fetch_latest_git_deps: self.move_options.skip_fetch_latest_git_deps,
             compiler_config: CompilerConfig {
-                known_attributes: known_attributes.clone(),
+                known_attributes,
                 skip_attribute_checks: self.move_options.skip_attribute_checks,
                 bytecode_version: fix_bytecode_version(
                     self.move_options.bytecode_version,
@@ -588,8 +591,17 @@ impl CliCommand<&'static str> for TestPackage {
             ..Default::default()
         };
 
+
         let path = self.move_options.get_package_path()?;
-        let result = move_cli::base::test::run_move_unit_tests(
+        let aptos_natives = aptos_debug_natives::aptos_debug_natives(
+            NativeGasParameters::zeros(),
+            MiscGasParameters::zeros(),
+        );
+        let unit_test_factory = AptosUnitTestFactory::new(
+            path.clone(),
+            config.clone(),
+        )?;
+        let result = move_cli::base::test::run_move_unit_tests_with_factory(
             path.as_path(),
             config.clone(),
             UnitTestingConfig {
@@ -611,15 +623,11 @@ impl CliCommand<&'static str> for TestPackage {
                 ..UnitTestingConfig::default()
             },
             // TODO(Gas): we may want to switch to non-zero costs in the future
-            aptos_debug_natives::aptos_debug_natives(
-                NativeGasParameters::zeros(),
-                MiscGasParameters::zeros(),
-            ),
+            aptos_natives,
             aptos_test_feature_flags_genesis(),
-            None,
-            None,
             self.compute_coverage,
             &mut std::io::stdout(),
+            unit_test_factory
         )
         .map_err(|err| CliError::UnexpectedError(format!("Failed to run tests: {:#}", err)))?;
 

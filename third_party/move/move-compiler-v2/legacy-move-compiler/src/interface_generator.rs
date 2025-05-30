@@ -187,38 +187,61 @@ fn write_struct_def(ctx: &mut Context, sdef: &StructDefinition) -> String {
     let mut out = String::new();
 
     let shandle = ctx.module.struct_handle_at(sdef.struct_handle);
-
     push_line!(
         out,
         format!(
-            "    struct {}{}{} {{",
+            "    {} {}{}{} {{",
+            if sdef.field_information.variant_count() == 0 {
+                "struct"
+            } else {
+                "enum"
+            },
             ctx.module.identifier_at(shandle.name),
             write_struct_type_parameters(&shandle.type_parameters),
             write_ability_modifiers(shandle.abilities),
         )
     );
 
-    let fields = match &sdef.field_information {
+    match &sdef.field_information {
         StructFieldInformation::Native => {
             push!(out, "    }");
             return out;
         },
-        StructFieldInformation::Declared(fields) => fields,
-        StructFieldInformation::DeclaredVariants(..) => {
-            // TODO(#13806): consider implement if interface generator will be
-            //   reused once v1 compiler retires
-            panic!("variants not yet supported by interface generator")
+        StructFieldInformation::Declared(fields) => {
+            for field in fields {
+                push_line!(
+                    out,
+                    format!(
+                        "        {}: {},",
+                        ctx.module.identifier_at(field.name),
+                        write_signature_token(ctx, &field.signature.0),
+                    )
+                )
+            }
         },
-    };
-    for field in fields {
-        push_line!(
-            out,
-            format!(
-                "        {}: {},",
-                ctx.module.identifier_at(field.name),
-                write_signature_token(ctx, &field.signature.0),
-            )
-        )
+        StructFieldInformation::DeclaredVariants(variants) => {
+            for variant in variants {
+                push_line!(
+                    out,
+                    format!("    {}", ctx.module.identifier_at(variant.name),)
+                );
+                if !variant.fields.is_empty() {
+                    push!(out, " {");
+                    for field in &variant.fields {
+                        push_line!(
+                            out,
+                            format!(
+                                "        {}: {},",
+                                ctx.module.identifier_at(field.name),
+                                write_signature_token(ctx, &field.signature.0),
+                            )
+                        )
+                    }
+                    push!(out, "    }");
+                }
+                push!(out, ",\n");
+            }
+        },
     }
 
     push!(out, "    }");
