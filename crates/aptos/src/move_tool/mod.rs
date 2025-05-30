@@ -1,6 +1,7 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::move_tool::unit_test_factory::AptosUnitTestFactory;
 use crate::{
     account::derive_resource_account::ResourceAccountSeed,
     common::{
@@ -87,6 +88,7 @@ mod manifest;
 pub mod package_hooks;
 mod show;
 pub mod stored_package;
+mod unit_test_factory;
 
 const HELLO_BLOCKCHAIN_EXAMPLE: &str = include_str!(
     "../../../../aptos-move/move-examples/hello_blockchain/sources/hello_blockchain.move"
@@ -590,7 +592,16 @@ impl CliCommand<&'static str> for TestPackage {
         };
 
         let path = self.move_options.get_package_path()?;
-        let result = move_cli::base::test::run_move_unit_tests(
+        let aptos_natives = aptos_debug_natives::aptos_debug_natives(
+            NativeGasParameters::zeros(),
+            MiscGasParameters::zeros(),
+        );
+        let unit_test_factory = AptosUnitTestFactory::new(
+            path.clone(),
+            config.clone(),
+            aptos_natives.clone(),
+        );
+        let result = move_cli::base::test::run_move_unit_tests_with_factory(
             path.as_path(),
             config.clone(),
             UnitTestingConfig {
@@ -612,15 +623,11 @@ impl CliCommand<&'static str> for TestPackage {
                 ..UnitTestingConfig::default()
             },
             // TODO(Gas): we may want to switch to non-zero costs in the future
-            aptos_debug_natives::aptos_debug_natives(
-                NativeGasParameters::zeros(),
-                MiscGasParameters::zeros(),
-            ),
+            aptos_natives,
             aptos_test_feature_flags_genesis(),
-            None,
-            None,
             self.compute_coverage,
             &mut std::io::stdout(),
+            unit_test_factory
         )
         .map_err(|err| CliError::UnexpectedError(format!("Failed to run tests: {:#}", err)))?;
 

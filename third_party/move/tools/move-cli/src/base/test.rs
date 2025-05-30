@@ -170,7 +170,7 @@ pub fn run_move_unit_tests<W: Write + Send>(
     )
 }
 
-pub fn run_move_unit_tests_with_factory<W: Write + Send, F: UnitTestFactory + Send>(
+pub fn run_move_unit_tests_with_factory<W: Write + Send, F: UnitTestFactory + Send + Sync>(
     pkg_path: &Path,
     mut build_config: move_package::BuildConfig,
     mut unit_test_config: UnitTestingConfig,
