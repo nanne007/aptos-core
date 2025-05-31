@@ -89,9 +89,7 @@ move-symbol-pool = { workspace = true }
 move-unit-test = { workspace = true, features = ["debugging"] }
 move-vm-runtime = { workspace = true, features = ["testing"] }
 move-vm-types = { workspace = true }
-move-vm-test-utils = { workspace = true }
 move-bytecode-utils = { workspace = true }
-aptos-language-e2e-tests = { workspace = true }
 move-table-extension = { workspace = true }
 move-resource-viewer = { workspace = true }
 open = { workspace = true }

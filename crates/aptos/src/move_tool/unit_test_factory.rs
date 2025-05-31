@@ -6,11 +6,13 @@ use aptos_framework::natives::event::NativeEventContext;
 use aptos_framework::natives::randomness::RandomnessContext;
 use aptos_framework::natives::transaction_context::NativeTransactionContext;
 
+use aptos_framework::extended_checks::run_extended_checks;
 use aptos_rest_client::AptosBaseUrl;
 use aptos_table_natives::{NativeTableContext, TableChangeSet};
 use aptos_transaction_simulation::{DeltaStateStore, EitherStateView, EmptyStateView, SimulationStateStore, GENESIS_CHANGE_SET_HEAD};
 use aptos_types::chain_id::ChainId;
 use aptos_types::state_store::state_key::StateKey;
+use aptos_types::vm::module_metadata::{RuntimeModuleMetadataV1, APTOS_METADATA_KEY, APTOS_METADATA_KEY_V1, METADATA_V1_MIN_FILE_FORMAT_VERSION};
 use aptos_validator_interface::{DebuggerStateView, RestDebuggerInterface};
 use aptos_vm::data_cache::AsMoveResolver;
 use aptos_vm_environment::environment::AptosEnvironment;
@@ -24,14 +26,15 @@ use move_binary_format::CompiledModule;
 use move_bytecode_utils::compiled_module_viewer::CompiledModuleView;
 use move_core_types::effects::Op;
 use move_core_types::language_storage::ModuleId;
+use move_core_types::metadata::Metadata;
 use move_core_types::value::MoveTypeLayout;
 use move_core_types::{effects::ChangeSet, value::MoveValue};
-use move_package::BuildConfig;
+use move_package::{BuildConfig, ModelConfig};
 use move_table_extension::{TableHandle, TableResolver};
 use move_unit_test::test_reporter::{AsModuleStorage, AsResourceResolver, TestRunInfo, UnitTestFactory};
-use move_vm_runtime::native_functions::NativeFunctionTable;
 use move_vm_runtime::{native_extensions::NativeContextExtensions, AsFunctionValueExtension, ModuleStorage};
 use move_vm_types::{gas::UnmeteredGasMeter, resolver::ResourceResolver};
+use std::collections::BTreeMap;
 use std::{fmt, path::PathBuf, str::FromStr, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
@@ -41,8 +44,7 @@ const APTOS_REST_API_KEY: &str = "APTOS_REST_API_KEY";
 
 pub(crate) struct AptosUnitTestFactory {
     package_path: PathBuf,
-    build_config: BuildConfig,
-    natives: NativeFunctionTable,
+    module_metadatas: BTreeMap<ModuleId, RuntimeModuleMetadataV1>,
     rt_handle: Handle,
 }
 
@@ -108,18 +110,28 @@ impl UnitTestFactory for AptosUnitTestFactory {
     }
 }
 
+
 impl AptosUnitTestFactory {
     pub fn new(
         package_path: PathBuf,
         build_config: BuildConfig,
-        natives: NativeFunctionTable,
-    ) -> Self {
-        Self {
+    ) -> anyhow::Result<Self> {
+        let model_config = ModelConfig {
+            all_files_as_targets: true,
+            target_filter: None,
+            compiler_version: build_config.compiler_config
+                .compiler_version
+                .unwrap_or_default(),
+            language_version: build_config.compiler_config.language_version.unwrap_or_default(),
+        };
+        let global_env = build_config.move_model_for_package(&package_path, model_config)?;
+        let module_metadatas = run_extended_checks(&global_env);
+
+        Ok(Self {
             package_path,
-            build_config,
-            natives,
+            module_metadatas,
             rt_handle: Handle::current(),
-        }
+        })
     }
 
     fn setup_store(
@@ -129,9 +141,26 @@ impl AptosUnitTestFactory {
         test: &TestCase,
     ) -> StateStore {
         // remote client need to spawn an async task to run the setup
-        self.rt_handle.block_on(async {
+        let store = self.rt_handle.block_on(async {
             setup_store(test_plan, module_test_plan, test)
-        })
+        });
+
+        let modules = test_plan.module_info.values().map(|info| match info {
+            NamedOrBytecodeModule::Named(named_compiled_module) => {
+                &named_compiled_module.module
+            },
+            NamedOrBytecodeModule::Bytecode(compiled_module) => compiled_module,
+        });
+
+        for m in modules {
+            let mut m = m.clone();
+            inject_runtime_metadata(&mut m, &self.module_metadatas, None);
+            store.inner
+                .add_module(&m)
+                .expect("Failed to add module to state store during unit test setup");
+        }
+
+        store
     }
 }
 fn setup_store(
@@ -149,18 +178,6 @@ fn setup_store(
         state_store
     };
 
-    let modules = test_plan.module_info.values().map(|info| match info {
-        NamedOrBytecodeModule::Named(named_compiled_module) => {
-            &named_compiled_module.module
-        },
-        NamedOrBytecodeModule::Bytecode(compiled_module) => compiled_module,
-    });
-
-    for m in modules {
-        store
-            .add_module(m)
-            .expect("Failed to add module to state store during unit test setup");
-    }
     StateStore {
         runtime_env: AptosEnvironment::new(&store),
         inner: store,
@@ -344,3 +361,35 @@ fn print_table_cs<W: fmt::Write>(
         }
     }
 }
+
+
+fn inject_runtime_metadata(
+    module: &mut CompiledModule,
+    metadata: &BTreeMap<ModuleId, RuntimeModuleMetadataV1>,
+    bytecode_version: Option<u32>,
+) {
+    if let Some(module_metadata) = metadata.get(&module.self_id()) {
+        if !module_metadata.is_empty() {
+            if bytecode_version.unwrap_or(METADATA_V1_MIN_FILE_FORMAT_VERSION)
+                >= METADATA_V1_MIN_FILE_FORMAT_VERSION
+            {
+                let serialized_metadata = bcs::to_bytes(&module_metadata)
+                    .expect("BCS for RuntimeModuleMetadata");
+                module.metadata.push(Metadata {
+                    key: APTOS_METADATA_KEY_V1.to_vec(),
+                    value: serialized_metadata,
+                });
+            } else {
+                let serialized_metadata =
+                    bcs::to_bytes(&module_metadata.clone().downgrade())
+                        .expect("BCS for RuntimeModuleMetadata");
+                module.metadata.push(Metadata {
+                    key: APTOS_METADATA_KEY.to_vec(),
+                    value: serialized_metadata,
+                });
+            }
+        }
+    }
+}
+
+

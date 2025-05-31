@@ -591,6 +591,7 @@ impl CliCommand<&'static str> for TestPackage {
             ..Default::default()
         };
 
+
         let path = self.move_options.get_package_path()?;
         let aptos_natives = aptos_debug_natives::aptos_debug_natives(
             NativeGasParameters::zeros(),
@@ -599,8 +600,7 @@ impl CliCommand<&'static str> for TestPackage {
         let unit_test_factory = AptosUnitTestFactory::new(
             path.clone(),
             config.clone(),
-            aptos_natives.clone(),
-        );
+        )?;
         let result = move_cli::base::test::run_move_unit_tests_with_factory(
             path.as_path(),
             config.clone(),
