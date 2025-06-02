@@ -1,7 +1,7 @@
 // Copyright © Aptos Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::move_tool::unit_test_factory::AptosUnitTestFactory;
+use crate::move_tool::unit_test_factory::{fork_attributes, AptosUnitTestFactory};
 use crate::{
     account::derive_resource_account::ResourceAccountSeed,
     common::{
@@ -563,7 +563,8 @@ impl CliCommand<&'static str> for TestPackage {
     }
 
     async fn execute(self) -> CliTypedResult<&'static str> {
-        let known_attributes = extended_checks::get_all_attribute_names();
+        let mut known_attributes = extended_checks::get_all_attribute_names().clone();
+        known_attributes.insert(fork_attributes::FORK.to_string());
         let mut config = BuildConfig {
             dev_mode: self.move_options.dev,
             additional_named_addresses: self.move_options.named_addresses(),
@@ -572,7 +573,7 @@ impl CliCommand<&'static str> for TestPackage {
             install_dir: self.move_options.output_dir.clone(),
             skip_fetch_latest_git_deps: self.move_options.skip_fetch_latest_git_deps,
             compiler_config: CompilerConfig {
-                known_attributes: known_attributes.clone(),
+                known_attributes,
                 skip_attribute_checks: self.move_options.skip_attribute_checks,
                 bytecode_version: fix_bytecode_version(
                     self.move_options.bytecode_version,

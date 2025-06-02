@@ -120,10 +120,6 @@ async fn handler_thread<'a>(
             let db = db.clone();
             let cache = cache.clone();
             tokio::spawn(async move {
-                println!(
-                    "Fetching state value for key: {:?} at version: {}",
-                    key.inner(), version - 1
-                );
                 let res = db.get_state_value_by_version(&key, version - 1).await;
                 match res {
                     Ok(val) => {
