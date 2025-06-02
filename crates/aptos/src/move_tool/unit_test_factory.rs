@@ -79,7 +79,6 @@ impl AptosUnitTestFactory {
         let global_env = build_config.move_model_for_package(&package_path, model_config)?;
         let module_metadatas = run_extended_checks(&global_env);
         let fork_plans = construct_fork_plan(&global_env, None);
-        println!("{:?}", &fork_plans);
         Ok(Self {
             package_path,
             module_metadatas,
