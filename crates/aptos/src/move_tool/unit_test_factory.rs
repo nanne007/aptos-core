@@ -32,6 +32,7 @@ use aptos_vm_types::{module_and_script_storage::AsAptosCodeStorage, resolver::TR
 use bytes::Bytes;
 use itertools::Itertools;
 use legacy_move_compiler::unit_test::{ModuleTestPlan, NamedOrBytecodeModule, TestCase, TestPlan};
+use move_binary_format::access::ModuleAccess;
 use move_binary_format::{errors::PartialVMError, CompiledModule};
 use move_bytecode_utils::compiled_module_viewer::CompiledModuleView;
 use move_core_types::{
@@ -110,6 +111,14 @@ impl AptosUnitTestFactory {
 
         for m in modules {
             let mut m = m.clone();
+
+            let contain_native = m.function_defs().iter().any(|f| f.is_native());
+            // let is_core_module = m.self_id().address() == &CORE_CODE_ADDRESS;
+
+            // skip override modules that have native functions
+            if contain_native {
+                continue;
+            }
             inject_runtime_metadata(&mut m, &self.module_metadatas, None);
             store
                 .inner
