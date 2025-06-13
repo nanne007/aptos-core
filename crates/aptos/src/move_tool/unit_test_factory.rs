@@ -1,3 +1,4 @@
+use crate::common::utils::chain_id;
 use crate::move_tool::unit_test_factory::fork_attributes::{
     construct_fork_plan, ForkInfo, ModuleTestForkPlan,
 };
@@ -268,14 +269,14 @@ async fn create_store(
     }
     let rest_client = builder.build();
 
-
+    let chain_id = chain_id(&rest_client).await.unwrap();
     let debugger = Arc::new(RestDebuggerInterface::new(rest_client));
     let version = match fork_info.version {
         Some(v) => v,
         None => debugger.get_latest_ledger_info_version().await.unwrap()
     };
     let debugger_state_view = DebuggerStateView::new(debugger, version);
-    let cache_dir = package_path.join(CACHE_DIR).join(version.to_string());
+    let cache_dir = package_path.join(CACHE_DIR).join(chain_id.id().to_string()).join(version.to_string());
     let state_view = CachedRemoteStateView {
         cache: LocalFileCache::new(cache_dir),
         state_view: debugger_state_view,
