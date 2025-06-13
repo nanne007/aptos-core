@@ -17,6 +17,10 @@ use aptos_table_natives::{NativeTableContext, TableChangeSet};
 use aptos_transaction_simulation::{
     DeltaStateStore, EitherStateView, EmptyStateView, SimulationStateStore, GENESIS_CHANGE_SET_HEAD,
 };
+use aptos_types::state_store::errors::StateViewError;
+use aptos_types::state_store::state_storage_usage::StateStorageUsage;
+use aptos_types::state_store::state_value::StateValue;
+use aptos_types::state_store::{StateViewResult, TStateView};
 use aptos_types::{
     chain_id::ChainId,
     state_store::state_key::StateKey,
@@ -33,8 +37,10 @@ use bytes::Bytes;
 use itertools::Itertools;
 use legacy_move_compiler::unit_test::{ModuleTestPlan, NamedOrBytecodeModule, TestCase, TestPlan};
 use move_binary_format::access::ModuleAccess;
+use move_binary_format::file_format::StructFieldInformation;
 use move_binary_format::{errors::PartialVMError, CompiledModule};
 use move_bytecode_utils::compiled_module_viewer::CompiledModuleView;
+use move_core_types::language_storage::CORE_CODE_ADDRESS;
 use move_core_types::{
     effects::{ChangeSet, Op},
     language_storage::ModuleId,
@@ -50,13 +56,15 @@ use move_vm_runtime::{
     native_extensions::NativeContextExtensions, AsFunctionValueExtension, ModuleStorage,
 };
 use move_vm_types::{gas::UnmeteredGasMeter, resolver::ResourceResolver};
+use serde::Serialize;
 use std::{collections::BTreeMap, fmt, path::PathBuf, str::FromStr, sync::Arc};
 use tokio::runtime::Handle;
 use url::Url;
 
-type FakeExecutorStateStore = DeltaStateStore<EitherStateView<EmptyStateView, DebuggerStateView>>;
+type FakeExecutorStateStore = DeltaStateStore<EitherStateView<EmptyStateView, CachedRemoteStateView<DebuggerStateView>>>;
 const APTOS_REST_API_KEY: &str = "APTOS_REST_API_KEY";
 
+const CACHE_DIR: &str = "cache";
 pub(crate) struct AptosUnitTestFactory {
     package_path: PathBuf,
     module_metadatas: BTreeMap<ModuleId, RuntimeModuleMetadataV1>,
@@ -99,10 +107,11 @@ impl AptosUnitTestFactory {
             .get(&module_test_plan.module_id)
             .and_then(|m| m.infos.get(&test.test_name))
             .cloned();
+
         // remote client need to spawn an async task to run the setup
         let store = self
             .rt_handle
-            .block_on(setup_store(test_plan, module_test_plan, test, test_fork_info));
+            .block_on(setup_store(self.package_path.clone(), test_plan, module_test_plan, test, test_fork_info));
 
         let modules = test_plan.module_info.values().map(|info| match info {
             NamedOrBytecodeModule::Named(named_compiled_module) => &named_compiled_module.module,
@@ -112,11 +121,12 @@ impl AptosUnitTestFactory {
         for m in modules {
             let mut m = m.clone();
 
-            let contain_native = m.function_defs().iter().any(|f| f.is_native());
-            // let is_core_module = m.self_id().address() == &CORE_CODE_ADDRESS;
+            let contain_native_func = m.function_defs().iter().any(|f| f.is_native());
+            let contain_native_struct = m.struct_defs().iter().any(|s| matches!(s.field_information, StructFieldInformation::Native));
+            let is_core_module = m.self_id().address() == &CORE_CODE_ADDRESS;
 
-            // skip override modules that have native functions
-            if contain_native {
+            // skip override modules that have native functions or structs
+            if !is_core_module && (contain_native_func || contain_native_struct) {
                 continue;
             }
             inject_runtime_metadata(&mut m, &self.module_metadatas, None);
@@ -195,13 +205,14 @@ impl UnitTestFactory for AptosUnitTestFactory {
 }
 
 async fn setup_store(
+    package_path: PathBuf,
     test_plan: &TestPlan,
     module_test_plan: &ModuleTestPlan,
     test: &TestCase,
     fork_info: Option<ForkInfo>,
 ) -> StateStore {
     let store = if let Some(info) = fork_info {
-        create_store(test_plan, module_test_plan, test, info).await
+        create_store(package_path, test_plan, module_test_plan, test, info).await
     } else {
         let state_store = DeltaStateStore::new_with_base(EitherStateView::Left(EmptyStateView));
         state_store.set_chain_id(ChainId::test()).unwrap();
@@ -218,9 +229,10 @@ async fn setup_store(
     }
 }
 async fn create_store(
-    test_plan: &TestPlan,
-    module_test_plan: &ModuleTestPlan,
-    test: &TestCase,
+    package_path: PathBuf,
+    _test_plan: &TestPlan,
+    _module_test_plan: &ModuleTestPlan,
+    _test: &TestCase,
     fork_info: ForkInfo,
 ) -> FakeExecutorStateStore {
     let network_url = fork_info.network.unwrap_or("testnet".to_string());
@@ -263,8 +275,14 @@ async fn create_store(
         None => debugger.get_latest_ledger_info_version().await.unwrap()
     };
     let debugger_state_view = DebuggerStateView::new(debugger, version);
+    let cache_dir = package_path.join(CACHE_DIR).join(version.to_string());
+    let state_view = CachedRemoteStateView {
+        cache: LocalFileCache::new(cache_dir),
+        state_view: debugger_state_view,
+    };
+
     let state_store = DeltaStateStore::new_with_base(EitherStateView::<EmptyStateView, _>::Right(
-        debugger_state_view,
+        state_view,
     ));
     state_store
 }
@@ -422,10 +440,12 @@ fn inject_runtime_metadata(
 pub(crate) mod fork_attributes {
     use legacy_move_compiler::shared::known_attributes::TestingAttribute;
     use move_command_line_common::{address::NumericalAddress, parser::NumberFormat};
+    use move_compiler_v2::plan_builder::convert_constant_value_u64_constant_or_value;
     use move_core_types::{
-        account_address::AccountAddress, identifier::Identifier, language_storage::ModuleId,
-        u256::U256,
+        account_address::AccountAddress, identifier::Identifier, language_storage::ModuleId
+        ,
     };
+    use move_model::ast::ModuleName;
     use move_model::{
         ast::{Address, Attribute, AttributeValue, Value},
         model::{FunctionEnv, GlobalEnv, ModuleEnv},
@@ -512,6 +532,7 @@ pub(crate) mod fork_attributes {
         module_env: &ModuleEnv,
         function: FunctionEnv,
     ) -> Option<ForkInfo> {
+        let current_module = module_env.get_name();
         let attrs = function.get_attributes();
         let fork_symbol = env.symbol_pool().make(FORK);
         let test_name = env.symbol_pool().make(TestingAttribute::TEST);
@@ -521,7 +542,7 @@ pub(crate) mod fork_attributes {
 
         if let Some(fork_attribute) = fork_attribute_opt {
             let mut fork_info = ForkInfo::default();
-            parse_fork_attribute(env, fork_attribute, &mut fork_info, 0);
+            parse_fork_attribute(env, current_module, fork_attribute, &mut fork_info, 0);
             Some(fork_info)
         } else {
             None
@@ -530,6 +551,7 @@ pub(crate) mod fork_attributes {
 
     fn parse_fork_attribute(
         env: &GlobalEnv,
+        current_module: &ModuleName,
         fork_attribute: &Attribute,
         fork_info: &mut ForkInfo,
         depth: usize,
@@ -545,7 +567,7 @@ pub(crate) mod fork_attributes {
                     "ICE: We should only be parsing a raw fork attribute"
                 );
                 vec.iter()
-                    .for_each(|attr| parse_fork_attribute(env, attr, fork_info, depth + 1));
+                    .for_each(|attr| parse_fork_attribute(env, current_module, attr, fork_info, depth + 1));
             },
             Attribute::Assign(id, sym, val) => {
                 if depth != 1 {
@@ -579,46 +601,24 @@ pub(crate) mod fork_attributes {
                         },
                     },
                     FORK_VERSION => {
-                        match val {
-                            AttributeValue::Value(_id, Value::Number(n)) => {
-                                if let Some(version) = n.to_biguint() {
-                                    let mut bytes = [0u8; 32];
-                                    version.to_bytes_le().into_iter().enumerate().for_each(
-                                        |(i, b)| {
-                                            bytes[i] = b;
-                                        },
-                                    );
-                                    let version = U256::from_le_bytes(&bytes);
-                                    if version <= U256::from(u64::MAX) {
-                                        fork_info.version = Some(version.unchecked_as_u64());
-                                    } else {
-                                        let aloc = env.get_node_loc(*id);
-                                        let assign_loc = env.get_node_loc(*id);
-                                        env.error_with_labels(
-                                            &assign_loc,
-                                            "attribute value too big",
-                                            vec![(aloc, "Assigned in this attribute".to_string())],
-                                        );
-                                    }
-                                } else {
-                                    let aloc = env.get_node_loc(*id);
-                                    let assign_loc = env.get_node_loc(*id);
-                                    env.error_with_labels(
-                                        &assign_loc,
-                                        "attribute version should be positive",
-                                        vec![(aloc, "Assigned in this attribute".to_string())],
-                                    );
-                                }
-                            },
-                            _ => {
+                        let version = convert_constant_value_u64_constant_or_value(
+                            env,
+                            current_module,
+                            val,
+                        ).map(|d| d.2);
+                        match version {
+                            None => {
                                 let aloc = env.get_node_loc(*id);
                                 let assign_loc = env.get_node_loc(*id);
                                 env.error_with_labels(
                                     &assign_loc,
-                                    "Unsupported attribute value",
+                                    "attribute value too big",
                                     vec![(aloc, "Assigned in this attribute".to_string())],
                                 );
-                            },
+                            }
+                            Some(v) => {
+                                fork_info.version = Some(v);
+                            }
                         }
                     },
                     _ => {
@@ -631,6 +631,64 @@ pub(crate) mod fork_attributes {
                     },
                 }
             },
+        }
+    }
+}
+
+struct CachedRemoteStateView<R> {
+    cache: LocalFileCache,
+    state_view: R,
+}
+impl<R: TStateView<Key=StateKey>> TStateView for CachedRemoteStateView<R> {
+    type Key = StateKey;
+
+    fn get_state_value(&self, state_key: &Self::Key) -> StateViewResult<Option<StateValue>> {
+        match self.cache.get_state_value(state_key) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => {
+                // If not found in cache, fetch from remote state view and save to cache
+                let value = self.state_view.get_state_value(state_key)?;
+                self.cache.save(state_key, &value)?;
+                Ok(value)
+            },
+            Err(e) => Err(e),
+        }
+    }
+
+    fn get_usage(&self) -> StateViewResult<StateStorageUsage> {
+        self.state_view.get_usage()
+    }
+}
+
+struct LocalFileCache {
+    base_dir: PathBuf,
+}
+
+impl LocalFileCache {
+    pub fn new(base_dir: PathBuf) -> Self {
+        std::fs::create_dir_all(&base_dir).expect("Failed to create base directory for file cache");
+        Self { base_dir }
+    }
+
+    pub fn save(&self, state_key: &StateKey, state_value: &Option<StateValue>) -> StateViewResult<()> {
+        let hash = state_key.crypto_hash_ref();
+        let file_path = self.base_dir.join(format!("{:x}.bcs", hash));
+        let bytes = bcs::to_bytes(state_value).map_err(|e| StateViewError::BcsError(e))?;
+        std::fs::write(&file_path, bytes)
+            .map_err(|e| StateViewError::Other(e.to_string()))?;
+        Ok(())
+    }
+
+    fn get_state_value(&self, state_key: &StateKey) -> StateViewResult<Option<Option<StateValue>>> {
+        let hash = state_key.crypto_hash_ref();
+        let file_path = self.base_dir.join(format!("{:x}.bcs", hash));
+        if file_path.exists() {
+            let bytes = std::fs::read(&file_path)
+                .map_err(|e| StateViewError::Other(e.to_string()))?;
+            let state = bcs::from_bytes(bytes.as_slice()).map_err(|e| StateViewError::BcsError(e))?;
+            Ok(Some(state))
+        } else {
+            Ok(None)
         }
     }
 }
