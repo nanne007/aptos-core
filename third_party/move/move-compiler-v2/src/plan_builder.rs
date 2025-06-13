@@ -576,7 +576,7 @@ fn convert_location(env: &GlobalEnv, attr: Attribute) -> Option<ModuleId> {
     }
 }
 
-fn convert_constant_value_u64_constant_or_value(
+pub fn convert_constant_value_u64_constant_or_value(
     env: &GlobalEnv,
     current_module: &ModuleName,
     value: &AttributeValue,

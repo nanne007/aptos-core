@@ -448,7 +448,11 @@ impl TestFailure {
                         },
                         NamedOrBytecodeModule::Bytecode(_compiled_module) => return None,
                     };
-                    let loc = function_source_map.get_code_location(*offset).unwrap();
+                    let loc = match function_source_map.get_code_location(*offset) {
+                        Some(loc) => loc,
+                        None => return None,
+                    };
+
                     let msg = format!("In this function in {}", format_module_id(module_id));
                     // TODO(tzakian) maybe migrate off of move-langs diagnostics?
                     Some(Diagnostic::new(
