@@ -47,15 +47,15 @@ impl ModuleSummary {
     pub fn summarize_csv<W: Write>(&self, summary_writer: &mut W) -> io::Result<()> {
         let module = format!(
             "{}::{}",
-            self.module_name.address().to_hex(),
+            self.module_name.address().short_str_lossless(),
             self.module_name.name()
         );
 
-        let mut format_line = |fn_name, covered, uncovered| {
+        let mut format_line = |fn_name, function_summary: &FunctionSummary| {
             writeln!(
                 summary_writer,
-                "{},{},{},{}",
-                module, fn_name, covered, uncovered
+                "{},{},{},{},{:.2}%",
+                module, fn_name, function_summary.covered, function_summary.total, function_summary.percent_coverage()
             )
         };
 
@@ -64,7 +64,7 @@ impl ModuleSummary {
             .iter()
             .filter(|(_, summary)| !summary.fn_is_native)
         {
-            format_line(fn_name, fn_summary.covered, fn_summary.total)?;
+            format_line(fn_name, &fn_summary)?;
         }
 
         Ok(())

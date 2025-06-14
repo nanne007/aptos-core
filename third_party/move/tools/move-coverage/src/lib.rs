@@ -53,7 +53,7 @@ pub fn format_csv_summary<M, F, W: Write>(
 ) where
     F: Fn(&CompiledModule, &M) -> ModuleSummary,
 {
-    writeln!(summary_writer, "ModuleName,FunctionName,Covered,Uncovered").unwrap();
+    writeln!(summary_writer, "ModuleName,FunctionName,Covered,Total,Coverage").unwrap();
 
     for module in modules.iter() {
         let coverage_summary = summary_func(module, coverage_map);
