@@ -397,11 +397,12 @@ impl TestFailure {
                         Err(_) => return "\tmalformed stack trace (no source map)".to_string(),
                     };
                 // unwrap here is a mirror of the same unwrap in report_error_with_location
-                let loc = function_source_map.get_code_location(frame.2).unwrap();
+                let loc = function_source_map.get_code_location(frame.2);
+
                 let fn_handle_idx = named_module.module.function_def_at(frame.1).function;
                 let fn_id_idx = named_module.module.function_handle_at(fn_handle_idx).name;
                 let fn_name = named_module.module.identifier_at(fn_id_idx).as_str();
-                let file_name = match test_plan.files.get(&loc.file_hash()) {
+                let file_name = match loc.map(|loc| loc.file_hash()).and_then(|fhash| test_plan.files.get(&fhash)) {
                     Some(v) => format!("{}", v.0),
                     None => "unknown_source".to_string(),
                 };
@@ -411,7 +412,13 @@ impl TestFailure {
                         module_id.name(),
                         fn_name,
                         file_name,
-                        Self::get_line_number(&loc, &files, &file_mapping)
+                        match loc {
+                            Some(loc) =>
+                                Self::get_line_number(&loc, &files, &file_mapping),
+                            None => {
+                                "no_source_line".to_string()
+                            }
+                        }
                     )
                     .to_string(),
                 );
