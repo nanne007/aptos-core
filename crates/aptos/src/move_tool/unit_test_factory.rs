@@ -22,6 +22,7 @@ use aptos_types::state_store::errors::StateViewError;
 use aptos_types::state_store::state_storage_usage::StateStorageUsage;
 use aptos_types::state_store::state_value::StateValue;
 use aptos_types::state_store::{StateViewResult, TStateView};
+use aptos_types::transaction::user_transaction_context::UserTransactionContext;
 use aptos_types::{
     chain_id::ChainId,
     state_store::state_key::StateKey,
@@ -41,6 +42,7 @@ use move_binary_format::access::ModuleAccess;
 use move_binary_format::file_format::StructFieldInformation;
 use move_binary_format::{errors::PartialVMError, CompiledModule};
 use move_bytecode_utils::compiled_module_viewer::CompiledModuleView;
+use move_core_types::account_address::AccountAddress;
 use move_core_types::language_storage::CORE_CODE_ADDRESS;
 use move_core_types::{
     effects::{ChangeSet, Op},
@@ -185,7 +187,16 @@ impl UnitTestFactory for AptosUnitTestFactory {
             vec![0],
             vec![1],
             resolver.inner.get_chain_id().unwrap().id(),
-            None,
+            Some(UserTransactionContext::new(
+                AccountAddress::ZERO,
+                vec![],
+                AccountAddress::ZERO,
+                0,
+                0,
+                resolver.inner.get_chain_id().unwrap().id(),
+                None,
+                None,
+            )),
         ));
         exts.add(NativeAggregatorContext::new(
             [0; 32],

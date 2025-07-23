@@ -1427,6 +1427,7 @@ name = "aptos-dynamic-transaction-composer"
 version = "0.1.4"
 dependencies = [
  "anyhow",
+ "aptos-framework",
  "aptos-types",
  "bcs 0.1.4",
  "e2e-move-tests",

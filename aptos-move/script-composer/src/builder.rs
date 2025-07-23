@@ -15,6 +15,7 @@ use crate::{
     ArgumentOperation, CallArgument, ComposerVersion, PreviousResult, APTOS_SCRIPT_COMPOSER_KEY,
 };
 use anyhow::{anyhow, bail, Result};
+use move_binary_format::file_format::CompiledScript;
 use move_binary_format::{
     access::ScriptAccess,
     binary_views::BinaryIndexedView,
@@ -168,6 +169,23 @@ impl TransactionComposer {
 }
 
 impl TransactionComposer {
+    pub fn from_script(script: CompiledScript) -> Self {
+        let parameters = script.signature_at(script.parameters).0.clone();
+
+        let builder = CompiledScriptBuilder::new(script);
+
+        Self {
+            builder,
+            calls: vec![],
+            parameters: vec![],
+            locals_availability: vec![],
+            locals_ty: vec![],
+            parameters_ty: parameters,
+
+            #[cfg(test)]
+            signer_count: 1,
+        }
+    }
     pub fn insert_module(&mut self, module: CompiledModule) {
         LOADED_MODULES.with(|modules| modules.borrow_mut().insert(module.self_id(), module));
     }

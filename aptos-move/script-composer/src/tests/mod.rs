@@ -2,11 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{CallArgument, TransactionComposer};
+use aptos_framework::{BuildOptions, BuiltPackage};
 use aptos_types::{
     state_store::state_key::StateKey,
     transaction::{ExecutionStatus, TransactionStatus},
 };
 use e2e_move_tests::MoveHarness;
+use move_binary_format::file_format::CompiledScript;
 use move_binary_format::CompiledModule;
 use move_core_types::{
     account_address::AccountAddress, language_storage::ModuleId, value::MoveValue,
@@ -19,6 +21,12 @@ fn load_module(builder: &mut TransactionComposer, harness: &MoveHarness, module_
         .read_state_value_bytes(&StateKey::module_id(&module))
         .unwrap();
     builder.insert_module(CompiledModule::deserialize(&bytes).unwrap());
+}
+
+
+fn compiled_test_script(package_path: &PathBuf) -> Vec<u8> {
+    let package = BuiltPackage::build(package_path.to_owned(), BuildOptions::default()).unwrap();
+    package.extract_script_code().pop().unwrap()
 }
 
 #[test]
@@ -230,6 +238,56 @@ fn chained_deposit_invalid_copy() {
         .is_err());
 }
 
+#[test]
+fn test_from_script() {
+    let mut h = MoveHarness::new();
+    let account = h.new_account_at(AccountAddress::ONE);
+    let alice = h.new_account_at(AccountAddress::from_hex_literal("0xcafe").unwrap());
+    let mut seq_num = 10;
+
+    let module_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("tests")
+        .join("test_modules");
+
+    let script = compiled_test_script(&module_path);
+    h.publish_package_cache_building(&account, &module_path);
+    let mut run_txn = |batch_builder: TransactionComposer, h: &mut MoveHarness| {
+        let script = batch_builder.generate_batched_calls(true).unwrap();
+        let txn = alice
+            .transaction()
+            .script(bcs::from_bytes(&script).unwrap())
+            .sequence_number(seq_num)
+            .sign();
+
+        seq_num += 1;
+
+        assert_eq!(
+            h.run(txn),
+            TransactionStatus::Keep(ExecutionStatus::Success)
+        );
+    };
+
+    // Create a copyable value and copy it twice
+    let mut builder = TransactionComposer::from_script(CompiledScript::deserialize(&script).unwrap());
+
+    load_module(&mut builder, &h, "0x1::batched_execution");
+
+    let _returns_1 = builder
+        .add_batched_call(
+            "0x1::batched_execution".to_string(),
+            "create_droppable_value".to_string(),
+            vec![],
+            vec![CallArgument::new_bytes(
+                MoveValue::U8(10).simple_serialize().unwrap(),
+            )],
+        )
+        .unwrap()
+        .pop()
+        .unwrap();
+
+    run_txn(builder, &mut h);
+}
 #[test]
 fn test_module() {
     let mut h = MoveHarness::new();
