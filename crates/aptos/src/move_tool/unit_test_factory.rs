@@ -400,7 +400,7 @@ fn print_table_cs<W: fmt::Write>(w: &mut W, cs: &TableChangeSet) {
             "new tables {}",
             cs.new_tables
                 .iter()
-                .map(|(k, v)| format!("{}<{},{}>", k, v.key_type, v.value_type))
+                .map(|(handle, table)| format!("({handle}: {table})"))
                 .join(", ")
         )
             .unwrap();
