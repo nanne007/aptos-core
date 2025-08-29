@@ -1781,6 +1781,9 @@ pub struct TransactionOptions {
     /// flamegraphs that reflect the gas usage.
     #[clap(long)]
     pub(crate) profile_gas: bool,
+
+    #[clap(long)]
+    pub(crate) force: bool,
 }
 
 impl TransactionOptions {
@@ -1935,7 +1938,7 @@ impl TransactionOptions {
             let simulated_txn = txns.first().unwrap();
 
             // Check if the transaction will pass, if it doesn't then fail
-            if !simulated_txn.info.success {
+            if !simulated_txn.info.success && !self.force {
                 return Err(CliError::SimulationError(
                     simulated_txn.info.vm_status.clone(),
                 ));
